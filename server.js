@@ -22,6 +22,7 @@
 
 const express = require("express");
 const crypto = require("crypto");
+const path = require("path");
 const admin = require("firebase-admin");
 
 /* ---------------- config ---------------- */
@@ -132,6 +133,11 @@ function collectPayload(pay) {
 /* ---------------- app ---------------- */
 const app = express();
 app.use(express.json({ limit: "1mb" }));
+
+/* Serve the frontend (index.html, dashboard.html, wallet.html, etc.) from
+ * this same server/repo root, so the Render URL works as a normal site
+ * instead of only exposing the /api/* routes. */
+app.use(express.static(__dirname, { extensions: ["html"] }));
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, firebase: firebaseReady, marz: !!MARZ_AUTH, ts: Date.now() });
@@ -408,6 +414,16 @@ function verifyMarzSig(req, rawBody) {
 function fmtAmount(n) {
   return CURRENCY + " " + ROUND(n).toLocaleString("en-US", { maximumFractionDigits: 2 });
 }
+
+/* Fallback for anything not matched above (unknown API route or page). */
+app.use((req, res) => {
+  if (req.path.startsWith("/api/")) {
+    return res.status(404).json({ status: "error", message: "Not found" });
+  }
+  res.status(404).sendFile(path.join(__dirname, "index.html"), (err) => {
+    if (err) res.status(404).send("Not found");
+  });
+});
 
 app.listen(PORT, () => {
   console.log("[benz-pay] payments server listening on port " + PORT);
