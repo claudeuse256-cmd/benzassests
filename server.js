@@ -22,7 +22,6 @@
 
 const express = require("express");
 const crypto = require("crypto");
-const path = require("path");
 const admin = require("firebase-admin");
 
 /* ---------------- config ---------------- */
@@ -134,10 +133,12 @@ function collectPayload(pay) {
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-/* Serve the frontend (index.html, dashboard.html, wallet.html, etc.) from
- * this same server/repo root, so the Render URL works as a normal site
- * instead of only exposing the /api/* routes. */
-app.use(express.static(__dirname, { extensions: ["html"] }));
+/* This is an API-only backend. The frontend (index.html, wallet.html, etc.)
+ * is hosted separately and calls this service by URL (paySettings.serverUrl),
+ * e.g. fetch(serverUrl + "/api/collect"). No pages are served here. */
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "benz-assets-pay", message: "API is running. See /api/health." });
+});
 
 app.get("/api/health", (req, res) => {
   res.json({ ok: true, firebase: firebaseReady, marz: !!MARZ_AUTH, ts: Date.now() });
@@ -415,14 +416,9 @@ function fmtAmount(n) {
   return CURRENCY + " " + ROUND(n).toLocaleString("en-US", { maximumFractionDigits: 2 });
 }
 
-/* Fallback for anything not matched above (unknown API route or page). */
+/* Fallback for any unmatched route — always JSON, since this is an API-only service. */
 app.use((req, res) => {
-  if (req.path.startsWith("/api/")) {
-    return res.status(404).json({ status: "error", message: "Not found" });
-  }
-  res.status(404).sendFile(path.join(__dirname, "index.html"), (err) => {
-    if (err) res.status(404).send("Not found");
-  });
+  res.status(404).json({ status: "error", message: "Not found" });
 });
 
 app.listen(PORT, () => {
