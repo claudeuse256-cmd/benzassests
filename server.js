@@ -17,6 +17,11 @@
  *   MARZPAY_SIGNING_SECRET  Optional; verifies outgoing webhooks (X-MarzPay-*).
  *   ADMIN_API_KEY        Secret header (X-Admin-Key) required for /api/disburse and /api/marz/balance.
  *
+ * User-facing endpoints (Firebase ID token in Authorization: Bearer <token>):
+ *   POST /api/collect       Start a deposit — MarzPay sends a payment prompt to the user's phone.
+ *   POST /api/verify-name   Look up the registered name on a mobile money number.
+ *   POST /api/withdraw      Create + immediately pay out a withdrawal to a verified number.
+ *
  * Run:  npm install && node server.js
  */
 
@@ -158,6 +163,38 @@ app.get("/api/marz/balance", async (req, res) => {
   }
 });
 
+/* Look up the registered name on a mobile money number (MarzPay phone verification).
+ * Used by the wallet page so the user can confirm the recipient before withdrawing. */
+app.post("/api/verify-name", async (req, res) => {
+  if (!firebaseReady) return res.status(500).json({ status: "error", message: "Server Firebase is not configured." });
+  if (!MARZ_AUTH) return res.status(503).json({ status: "error", message: "MarzPay credentials not configured on the server." });
+  const uid = await tokenToUid(req);
+  if (!uid) return res.status(401).json({ status: "error", message: "Invalid or missing Firebase token." });
+
+  const phone = normalizeUG(req.body.phone || "");
+  if (!phone) return res.status(422).json({ status: "error", message: "A valid +256 phone number is required." });
+
+  try {
+    const r = await fetch(MARZ_BASE + "/phone-verification/verify", {
+      method: "POST",
+      headers: { Authorization: MARZ_AUTH, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ phone_number: phone.replace(/^\+/, "") })
+    });
+    const data = await r.json().catch(() => ({}));
+    const ok = r.ok && (data.status === "success" || data.success === true);
+    if (!ok) {
+      const msg = (data && data.message) || "Could not verify that number.";
+      return res.status(r.status === 401 ? 502 : 422).json({ status: "error", message: msg });
+    }
+    const d = data.data || {};
+    const name = d.full_name || d.name || "";
+    if (!name) return res.status(422).json({ status: "error", message: "No registered name found for that number." });
+    res.json({ status: "success", data: { name, phone: d.phone_number || phone } });
+  } catch (e) {
+    res.status(502).json({ status: "error", message: "Name lookup failed: " + e.message });
+  }
+});
+
 /* Automatic deposit: create a MarzPay collection. Wallet page calls this with the user's Firebase ID token. */
 app.post("/api/collect", async (req, res) => {
   if (!firebaseReady) return res.status(500).json({ status: "error", message: "Server Firebase is not configured." });
@@ -230,50 +267,40 @@ app.post("/api/collect", async (req, res) => {
   });
 });
 
-/* Automatic withdrawal payout. Called by the admin wallet panel with X-Admin-Key. */
-app.post("/api/disburse", async (req, res) => {
-  if (!adminKeyOk(req)) return res.status(401).json({ status: "error", message: "Invalid admin key" });
-  if (!firebaseReady) return res.status(500).json({ status: "error", message: "Server Firebase is not configured." });
-  if (!MARZ_AUTH) return res.status(503).json({ status: "error", message: "MarzPay credentials not configured on the server." });
-
-  const txId = String(req.body.txId || "").trim();
-  if (!txId) return res.status(422).json({ status: "error", message: "txId is required." });
-
+/* Shared payout logic: moves a pending withdrawal tx to "processing", debits the
+ * wallet, calls MarzPay send-money, and rolls back on failure. Used by both the
+ * admin-triggered /api/disburse and the user-triggered /api/withdraw below. */
+async function runDisbursement(txId, phoneOverride) {
   const txRef = db.collection("transactions").doc(txId);
-
   let payload = null;
-  let reference = UUID();
+  const reference = UUID();
 
-  try {
-    await db.runTransaction(async (tx) => {
-      const snap = await tx.get(txRef);
-      if (!snap.exists) throw Object.assign(new Error("Transaction not found."), { code: "NOT_FOUND" });
-      const t = snap.data();
-      if (t.type !== "withdraw") throw Object.assign(new Error("Transaction is not a withdrawal."), { code: "BAD_TYPE" });
-      if (t.status !== "pending") throw Object.assign(new Error("Withdrawal already processed (current state: " + t.status + ")."), { code: "STATE" });
-      const phone = normalizeUG(t.phone || req.body.phone || "");
-      if (!phone) throw Object.assign(new Error("Recipient phone number is missing or invalid."), { code: "NO_PHONE" });
-      const amount = ROUND(t.amount);
-      if (!amount || amount < MIN_UGX || amount > MAX_UGX) {
-        throw Object.assign(new Error("Amount outside MarzPay limits."), { code: "AMOUNT" });
-      }
-      const payout = ROUND(t.payout != null ? ROUND(t.payout) : (t.fee != null ? ROUND(amount - t.fee) : amount));
-      if (!payout || payout < MIN_UGX) {
-        throw Object.assign(new Error("Payout after the withdrawal fee (" + CURRENCY + " " + ROUND(payout).toLocaleString("en-US", { maximumFractionDigits: 2 }) + ") is below the " + MIN_UGX + " " + CURRENCY + " minimum."), { code: "AMOUNT" });
-      }
-      const w = await tx.get(db.collection("wallets").doc(t.userId));
-      const bal = w.exists ? (w.data().balance || 0) : 0;
-      if (bal < amount) throw Object.assign(new Error("Insufficient balance."), { code: "INSUFFICIENT" });
+  await db.runTransaction(async (tx) => {
+    const snap = await tx.get(txRef);
+    if (!snap.exists) throw Object.assign(new Error("Transaction not found."), { code: "NOT_FOUND" });
+    const t = snap.data();
+    if (t.type !== "withdraw") throw Object.assign(new Error("Transaction is not a withdrawal."), { code: "BAD_TYPE" });
+    if (t.status !== "pending") throw Object.assign(new Error("Withdrawal already processed (current state: " + t.status + ")."), { code: "STATE" });
+    const phone = normalizeUG(t.phone || phoneOverride || "");
+    if (!phone) throw Object.assign(new Error("Recipient phone number is missing or invalid."), { code: "NO_PHONE" });
+    const amount = ROUND(t.amount);
+    if (!amount || amount < MIN_UGX || amount > MAX_UGX) {
+      throw Object.assign(new Error("Amount outside MarzPay limits."), { code: "AMOUNT" });
+    }
+    const payout = ROUND(t.payout != null ? ROUND(t.payout) : (t.fee != null ? ROUND(amount - t.fee) : amount));
+    if (!payout || payout < MIN_UGX) {
+      throw Object.assign(new Error("Payout after the withdrawal fee (" + CURRENCY + " " + ROUND(payout).toLocaleString("en-US", { maximumFractionDigits: 2 }) + ") is below the " + MIN_UGX + " " + CURRENCY + " minimum."), { code: "AMOUNT" });
+    }
+    const w = await tx.get(db.collection("wallets").doc(t.userId));
+    const bal = w.exists ? (w.data().balance || 0) : 0;
+    if (bal < amount) throw Object.assign(new Error("Insufficient balance."), { code: "INSUFFICIENT" });
 
-      payload = { amount: payout, phone, country: t.country || MARZ_COUNTRY, reference, uid: t.userId, txId, type: "withdraw" };
+    payload = { amount: payout, phone, country: t.country || MARZ_COUNTRY, reference, uid: t.userId, txId, type: "withdraw" };
 
-      if (w.exists) tx.update(db.collection("wallets").doc(t.userId), { balance: ROUND(bal - amount), updatedAt: serverTs() });
-      else tx.set(db.collection("wallets").doc(t.userId), { balance: Math.max(0, ROUND(bal - amount)), updatedAt: serverTs() });
-      tx.update(txRef, { status: "processing", marzRef: reference, note: t.note || "Withdrawal payout", updatedAt: serverTs() });
-    });
-  } catch (e) {
-    return res.status(e.code === "NOT_FOUND" ? 404 : 422).json({ status: "error", message: e.message });
-  }
+    if (w.exists) tx.update(db.collection("wallets").doc(t.userId), { balance: ROUND(bal - amount), updatedAt: serverTs() });
+    else tx.set(db.collection("wallets").doc(t.userId), { balance: Math.max(0, ROUND(bal - amount)), updatedAt: serverTs() });
+    tx.update(txRef, { status: "processing", marzRef: reference, note: t.note || "Withdrawal payout", updatedAt: serverTs() });
+  });
 
   let marzData;
   try {
@@ -294,7 +321,7 @@ app.post("/api/disburse", async (req, res) => {
         tx.update(txRef, { status: "pending", marzRef: admin.firestore.FieldValue.delete(), updatedAt: serverTs() });
       });
     } catch (e2) { /* ignore rollback failure */ }
-    return res.status(502).json({ status: "error", message: "MarzPay rejected the payout: " + e.message });
+    throw Object.assign(new Error("MarzPay rejected the payout: " + e.message), { code: "MARZ" });
   }
 
   const provider = (marzData.data && marzData.data.transaction && marzData.data.transaction.provider) || "";
@@ -305,11 +332,99 @@ app.post("/api/disburse", async (req, res) => {
     updatedAt: serverTs()
   }).catch(() => {});
 
-  res.json({
-    status: "success",
-    message: "Payout initiated. Funds are sent to the customer's phone.",
-    data: { txId, marzRef: reference, provider: provider || "mtn" }
-  });
+  return { txId, marzRef: reference, provider: provider || "mtn" };
+}
+
+/* Automatic withdrawal payout. Called by the admin wallet panel with X-Admin-Key. */
+app.post("/api/disburse", async (req, res) => {
+  if (!adminKeyOk(req)) return res.status(401).json({ status: "error", message: "Invalid admin key" });
+  if (!firebaseReady) return res.status(500).json({ status: "error", message: "Server Firebase is not configured." });
+  if (!MARZ_AUTH) return res.status(503).json({ status: "error", message: "MarzPay credentials not configured on the server." });
+
+  const txId = String(req.body.txId || "").trim();
+  if (!txId) return res.status(422).json({ status: "error", message: "txId is required." });
+
+  try {
+    const result = await runDisbursement(txId, req.body.phone);
+    res.json({ status: "success", message: "Payout initiated. Funds are sent to the customer's phone.", data: result });
+  } catch (e) {
+    const httpCode = e.code === "NOT_FOUND" ? 404 : (e.code === "MARZ" ? 502 : 422);
+    res.status(httpCode).json({ status: "error", message: e.message });
+  }
+});
+
+/* Automatic user-triggered withdrawal. The wallet page calls this directly with the
+ * user's Firebase ID token once they've confirmed the recipient name via /api/verify-name.
+ * Creates the withdrawal transaction and pays it out immediately — no admin step. */
+app.post("/api/withdraw", async (req, res) => {
+  if (!firebaseReady) return res.status(500).json({ status: "error", message: "Server Firebase is not configured." });
+  if (!MARZ_AUTH) return res.status(503).json({ status: "error", message: "MarzPay credentials not configured on the server." });
+  const uid = await tokenToUid(req);
+  if (!uid) return res.status(401).json({ status: "error", message: "Invalid or missing Firebase token." });
+
+  const amount = ROUND(req.body.amount);
+  const phone = normalizeUG(req.body.phone || "");
+  const country = req.body.country || MARZ_COUNTRY;
+  const channel = String(req.body.channel || "").toLowerCase();
+  const recipientName = String(req.body.recipientName || "").trim();
+
+  if (!amount || amount < MIN_UGX || amount > MAX_UGX) {
+    return res.status(422).json({ status: "error", message: "Amount must be between " + MIN_UGX + " and " + MAX_UGX + " " + CURRENCY + "." });
+  }
+  if (!phone) return res.status(422).json({ status: "error", message: "A valid +256 mobile money number is required." });
+
+  let profile = {};
+  try {
+    const p = await db.collection("users").doc(uid).get();
+    if (p.exists) profile = p.data();
+  } catch (e) { /* ignore */ }
+  if (profile.banned) return res.status(403).json({ status: "error", message: "Account suspended." });
+
+  const pct = Number(req.body.feePercent) || 0;
+  const fee = ROUND(amount * pct / 100);
+  const payout = ROUND(amount - fee);
+  if (!payout || payout < MIN_UGX) {
+    return res.status(422).json({ status: "error", message: "The amount you will receive after the withdrawal fee is below the " + MIN_UGX + " " + CURRENCY + " minimum." });
+  }
+
+  let txRef;
+  try {
+    await db.runTransaction(async (tx) => {
+      const wRef = db.collection("wallets").doc(uid);
+      const w = await tx.get(wRef);
+      const bal = w.exists ? (w.data().balance || 0) : 0;
+      if (bal < amount) throw Object.assign(new Error("Amount exceeds your available balance."), { code: "INSUFFICIENT" });
+
+      txRef = db.collection("transactions").doc();
+      tx.set(txRef, {
+        userId: uid,
+        userName: profile.fullName || "Member",
+        type: "withdraw",
+        amount,
+        fee,
+        payout,
+        phone,
+        country,
+        channel: channel === "airtel" ? "airtel" : "mtn",
+        mode: "auto",
+        status: "pending",
+        note: recipientName ? ("Withdrawal to " + recipientName) : "Withdrawal payout",
+        recipientName: recipientName || null,
+        createdAt: serverTs(),
+        updatedAt: serverTs()
+      });
+    });
+  } catch (e) {
+    return res.status(e.code === "INSUFFICIENT" ? 422 : 500).json({ status: "error", message: e.message });
+  }
+
+  try {
+    const result = await runDisbursement(txRef.id, phone);
+    res.json({ status: "success", message: "Withdrawal sent. Funds are on their way to your mobile money number.", data: result });
+  } catch (e) {
+    const httpCode = e.code === "NOT_FOUND" ? 404 : (e.code === "MARZ" ? 502 : 422);
+    res.status(httpCode).json({ status: "error", message: e.message });
+  }
 });
 
 /* MarzPay webhook — handles collection.completed/failed and disbursement.completed/failed. */
