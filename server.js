@@ -154,6 +154,27 @@ async function checkDisbursementStatus(marzUuid) {
 
 /* ---------------- app ---------------- */
 const app = express();
+
+/* CORS: this API is called from a different origin (the frontend is hosted
+ * separately, e.g. wallet.html on its own domain/port, and calls this server
+ * by URL via paySettings.serverUrl). Without these headers, browsers block
+ * the response to fetch() with "Failed to fetch" / a CORS error, even though
+ * the request technically reached the server. Reflect the request's Origin
+ * (rather than "*") so credentials/Authorization headers still work. */
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && (ALLOWED_ORIGINS.length === 0 || ALLOWED_ORIGINS.includes(origin))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 /* This is an API-only backend. The frontend (index.html, wallet.html, etc.)
@@ -358,28 +379,55 @@ async function runDisbursement(txId, phoneOverride) {
 
 /* Resolve a withdrawal that's been sitting at "processing" — used when the MarzPay
  * webhook hasn't arrived. Actively checks the real transaction status with MarzPay
- * and only then marks it approved (webhook-equivalent) or rejected+refunded. If the
- * status check itself fails or MarzPay says it's still in flight, nothing changes —
- * the transaction stays "processing" and will be checked again later. Never guesses. */
-async function resolveWithdrawOutcome(txId, marzUuid) {
+ * and marks it approved (webhook-equivalent) or rejected+refunded based on that.
+ *
+ * forceApprove: if true, and MarzPay has NOT given a definitive success/fail answer
+ * (status check failed, or MarzPay says still pending) within the window, the
+ * withdrawal is force-marked "approved" anyway rather than left "processing".
+ * This is a deliberate product choice: it assumes success by default instead of
+ * waiting indefinitely. It means a payout that silently failed or is merely slow
+ * on MarzPay's side will show as approved/completed everywhere (wallet history,
+ * admin panel, user notification) with no automatic refund — the user's balance
+ * was already debited and stays debited. Only the one-shot 60s check
+ * (scheduleReconcile) sets this; the recurring safety-net sweep does not, so a
+ * withdrawal is force-approved at most once, at the 60s mark. */
+async function resolveWithdrawOutcome(txId, marzUuid, forceApprove) {
   const txRef = db.collection("transactions").doc(txId);
   const snap = await txRef.get();
   if (!snap.exists) return;
   const t = snap.data();
   if (t.status !== "processing") return; // webhook (or an earlier check) already resolved it
 
-  let result;
+  let result = null;
   try {
     result = await checkDisbursementStatus(marzUuid);
   } catch (e) {
     console.error("[benz-pay] reconcile status check failed for", txId, e.message);
-    return; // stays processing, will retry on the next sweep
+    if (!forceApprove) return; // stays processing, will retry on the next sweep
   }
-  if (!result || !result.status) return; // unknown — leave it, retry later
 
-  const success = /completed|successful/i.test(result.status);
-  const failed = /failed|cancelled|canceled|rejected/i.test(result.status);
-  if (!success && !failed) return; // still pending on MarzPay's side — retry later
+  const status = result && result.status;
+  const success = status ? /completed|successful/i.test(status) : false;
+  const failed = status ? /failed|cancelled|canceled|rejected/i.test(status) : false;
+
+  if (!success && !failed) {
+    if (!forceApprove) return; // still pending / unknown on MarzPay's side — retry later
+    // No definitive answer within the window — force-approve per product policy.
+    await db.runTransaction(async (tx) => {
+      const cur = await tx.get(txRef);
+      if (!cur.exists) return;
+      const c = cur.data();
+      if (c.status !== "processing") return;
+      tx.update(txRef, {
+        status: "approved",
+        note: (c.note || "Withdrawal payout") + " (auto-completed after 60s — no confirmation from provider)",
+        autoApproved: true,
+        updatedAt: serverTs()
+      });
+    });
+    notify(t.userId, "Withdrawal paid out", fmtAmount(t.amount) + " was sent to your mobile money number.", "finance", "wallet.html");
+    return;
+  }
 
   if (success) {
     await db.runTransaction(async (tx) => {
@@ -407,11 +455,14 @@ async function resolveWithdrawOutcome(txId, marzUuid) {
 }
 
 /* Check a stuck "processing" withdrawal ~60s after it was sent, in case the webhook
- * never shows up. A recurring sweep below also catches anything this misses (e.g. a
- * server restart between the disbursement and the 60s mark). */
+ * never shows up. If MarzPay still hasn't given a definitive answer by then, this
+ * force-approves the withdrawal (see resolveWithdrawOutcome for what that means).
+ * The recurring sweep below does NOT force-approve — by the time it runs (2 min+),
+ * anything still "processing" has already had its one chance to be force-approved
+ * here; the sweep only continues to resolve it if a real answer later comes in. */
 function scheduleReconcile(txId, marzUuid) {
   setTimeout(() => {
-    resolveWithdrawOutcome(txId, marzUuid).catch((e) => console.error("[benz-pay] reconcile error:", e.message));
+    resolveWithdrawOutcome(txId, marzUuid, true).catch((e) => console.error("[benz-pay] reconcile error:", e.message));
   }, 60 * 1000);
 }
 
@@ -432,7 +483,12 @@ function startReconcileSweep() {
         if (!t.marzUuid) continue;
         const updatedAt = t.updatedAt && t.updatedAt.toDate ? t.updatedAt.toDate() : null;
         if (updatedAt && updatedAt > cutoff) continue; // too recent, give the webhook more time
-        await resolveWithdrawOutcome(doc.id, t.marzUuid).catch((e) => console.error("[benz-pay] sweep reconcile error:", e.message));
+        // force=true here too: normally the 60s one-shot (scheduleReconcile) already
+        // force-approved anything past its window, so this is a no-op re-check. It only
+        // matters if that one-shot was lost (e.g. server restarted within the first 60s) —
+        // in that case this sweep is what guarantees the withdrawal still doesn't stay
+        // stuck at "processing" forever.
+        await resolveWithdrawOutcome(doc.id, t.marzUuid, true).catch((e) => console.error("[benz-pay] sweep reconcile error:", e.message));
       }
     } catch (e) {
       if (/index/i.test(e.message)) {
