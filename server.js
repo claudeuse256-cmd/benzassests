@@ -22,6 +22,12 @@
  *   POST /api/verify-name   Look up the registered name on a mobile money number.
  *   POST /api/withdraw      Create + immediately pay out a withdrawal to a verified number.
  *
+ * Reliability: a withdrawal sent to MarzPay moves to "processing" and is normally
+ * resolved to "approved"/"rejected" by the /api/webhook callback. If that webhook
+ * doesn't arrive, a one-shot check ~60s after send, plus a recurring sweep every
+ * 2 minutes, actively asks MarzPay for the real transaction status and resolves it
+ * from that — it never assumes success or failure from silence alone.
+ *
  * Run:  npm install && node server.js
  */
 
@@ -132,6 +138,18 @@ function collectPayload(pay) {
       { benzTx: pay.txId, isPII: true }
     ]
   };
+}
+
+/* Look up the real status of a send-money disbursement on MarzPay by its transaction uuid.
+ * Used to reconcile withdrawals stuck at "processing" when the webhook never arrives. */
+async function checkDisbursementStatus(marzUuid) {
+  const res = await fetch(MARZ_BASE + "/send-money/" + encodeURIComponent(marzUuid), {
+    headers: { Authorization: MARZ_AUTH, Accept: "application/json" }
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data) return null;
+  const status = String((data.data && data.data.transaction && data.data.transaction.status) || "").toLowerCase();
+  return { status, raw: data };
 }
 
 /* ---------------- app ---------------- */
@@ -325,14 +343,105 @@ async function runDisbursement(txId, phoneOverride) {
   }
 
   const provider = (marzData.data && marzData.data.transaction && marzData.data.transaction.provider) || "";
+  const marzUuid = (marzData.data && marzData.data.transaction && marzData.data.transaction.uuid) || "";
   await txRef.update({
     channel: /airtel/i.test(provider) ? "airtel" : "mtn",
-    marzUuid: (marzData.data && marzData.data.transaction && marzData.data.transaction.uuid) || "",
+    marzUuid,
     providerMode: (marzData.data && marzData.data.transaction && marzData.data.transaction.mode) || "",
     updatedAt: serverTs()
   }).catch(() => {});
 
+  if (marzUuid) scheduleReconcile(txId, marzUuid);
+
   return { txId, marzRef: reference, provider: provider || "mtn" };
+}
+
+/* Resolve a withdrawal that's been sitting at "processing" — used when the MarzPay
+ * webhook hasn't arrived. Actively checks the real transaction status with MarzPay
+ * and only then marks it approved (webhook-equivalent) or rejected+refunded. If the
+ * status check itself fails or MarzPay says it's still in flight, nothing changes —
+ * the transaction stays "processing" and will be checked again later. Never guesses. */
+async function resolveWithdrawOutcome(txId, marzUuid) {
+  const txRef = db.collection("transactions").doc(txId);
+  const snap = await txRef.get();
+  if (!snap.exists) return;
+  const t = snap.data();
+  if (t.status !== "processing") return; // webhook (or an earlier check) already resolved it
+
+  let result;
+  try {
+    result = await checkDisbursementStatus(marzUuid);
+  } catch (e) {
+    console.error("[benz-pay] reconcile status check failed for", txId, e.message);
+    return; // stays processing, will retry on the next sweep
+  }
+  if (!result || !result.status) return; // unknown — leave it, retry later
+
+  const success = /completed|successful/i.test(result.status);
+  const failed = /failed|cancelled|canceled|rejected/i.test(result.status);
+  if (!success && !failed) return; // still pending on MarzPay's side — retry later
+
+  if (success) {
+    await db.runTransaction(async (tx) => {
+      const cur = await tx.get(txRef);
+      if (!cur.exists) return;
+      const c = cur.data();
+      if (c.status !== "processing") return;
+      tx.update(txRef, { status: "approved", note: (c.note || "Withdrawal payout") + " (confirmed via status check)", updatedAt: serverTs() });
+    });
+    notify(t.userId, "Withdrawal paid out", fmtAmount(t.amount) + " was sent to your mobile money number.", "finance", "wallet.html");
+  } else {
+    await db.runTransaction(async (tx) => {
+      const cur = await tx.get(txRef);
+      if (!cur.exists) return;
+      const c = cur.data();
+      if (c.status !== "processing") return;
+      const w = await tx.get(db.collection("wallets").doc(c.userId));
+      const bal = w.exists ? (w.data().balance || 0) : 0;
+      if (w.exists) tx.update(w.ref, { balance: ROUND(bal + c.amount), updatedAt: serverTs() });
+      else tx.set(w.ref, { balance: ROUND(c.amount), updatedAt: serverTs() });
+      tx.update(txRef, { status: "rejected", note: "Payout failed and funds were returned.", updatedAt: serverTs() });
+    });
+    notify(t.userId, "Withdrawal failed", "The payout of " + fmtAmount(t.amount) + " could not be sent. The amount was returned to your balance.", "ban", "wallet.html");
+  }
+}
+
+/* Check a stuck "processing" withdrawal ~60s after it was sent, in case the webhook
+ * never shows up. A recurring sweep below also catches anything this misses (e.g. a
+ * server restart between the disbursement and the 60s mark). */
+function scheduleReconcile(txId, marzUuid) {
+  setTimeout(() => {
+    resolveWithdrawOutcome(txId, marzUuid).catch((e) => console.error("[benz-pay] reconcile error:", e.message));
+  }, 60 * 1000);
+}
+
+/* Safety-net sweep: every 2 minutes, re-check any withdrawal still stuck at "processing"
+ * for more than 60 seconds (covers cases where the one-shot scheduleReconcile timer was
+ * lost to a server restart). Runs only if Firebase + MarzPay are configured. */
+function startReconcileSweep() {
+  if (!firebaseReady || !MARZ_AUTH) return;
+  setInterval(async () => {
+    try {
+      const cutoff = new Date(Date.now() - 60 * 1000);
+      const snap = await db.collection("transactions")
+        .where("type", "==", "withdraw")
+        .where("status", "==", "processing")
+        .get();
+      for (const doc of snap.docs) {
+        const t = doc.data();
+        if (!t.marzUuid) continue;
+        const updatedAt = t.updatedAt && t.updatedAt.toDate ? t.updatedAt.toDate() : null;
+        if (updatedAt && updatedAt > cutoff) continue; // too recent, give the webhook more time
+        await resolveWithdrawOutcome(doc.id, t.marzUuid).catch((e) => console.error("[benz-pay] sweep reconcile error:", e.message));
+      }
+    } catch (e) {
+      if (/index/i.test(e.message)) {
+        console.error("[benz-pay] reconcile sweep needs a Firestore composite index (type + status). Create it using the link Firestore includes in this error, then the sweep will start working:", e.message);
+      } else {
+        console.error("[benz-pay] reconcile sweep failed:", e.message);
+      }
+    }
+  }, 2 * 60 * 1000);
 }
 
 /* Automatic withdrawal payout. Called by the admin wallet panel with X-Admin-Key. */
@@ -539,4 +648,5 @@ app.use((req, res) => {
 app.listen(PORT, () => {
   console.log("[benz-pay] payments server listening on port " + PORT);
   console.log("[benz-pay] webhook endpoint: " + (PUBLIC_BASE_URL || "CALLBACK_URL_NOT_SET") + "/api/webhook");
+  startReconcileSweep();
 });
