@@ -309,6 +309,29 @@ app.post("/api/collect", async (req, res) => {
     updatedAt: serverTs()
   }).catch(() => {});
 
+  const isSandbox = /sandbox/i.test(String(mode || ""));
+  if (isSandbox) {
+    // Sandbox accounts return an immediate dummy "success" and send no webhook, so the
+    // deposit would otherwise sit at "pending" forever. Credit the wallet right away.
+    try {
+      await db.runTransaction(async (tx) => {
+        const cur = await tx.get(txRef);
+        if (!cur.exists) return;
+        const c = cur.data();
+        if (c.status !== "pending") return;
+        const wRef = db.collection("wallets").doc(c.userId);
+        const w = await tx.get(wRef);
+        const bal = w.exists ? (w.data().balance || 0) : 0;
+        if (w.exists) tx.update(wRef, { balance: ROUND(bal + c.amount), updatedAt: serverTs() });
+        else tx.set(wRef, { balance: ROUND(c.amount), updatedAt: serverTs() });
+        tx.update(txRef, { status: "approved", note: (c.note || "Mobile money deposit") + " (sandbox auto-approved)", updatedAt: serverTs() });
+      });
+      notify(uid, "Deposit received", fmtAmount(amount) + " was added to your wallet automatically.", "finance", "wallet.html");
+    } catch (e) {
+      console.error("[benz-pay] sandbox deposit credit failed:", e.message);
+    }
+  }
+
   if (marzUuid) scheduleDepositReconcile(txRef.id, marzUuid);
 
   res.json({
