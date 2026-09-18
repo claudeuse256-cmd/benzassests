@@ -1,4 +1,4 @@
-/* Benz Assets payments server.
+Benz assets payments server.
  *
  * Bridges the client app to MarzPay (https://wallet.wearemarz.com) for
  * MTN Mobile Money / Airtel Money collections (deposits) and disbursements
@@ -152,6 +152,19 @@ async function checkDisbursementStatus(marzUuid) {
   return { status, raw: data };
 }
 
+/* Look up the real status of a mobile-money collection on MarzPay by its transaction uuid.
+ * Used to reconcile automatic deposits stuck at "pending" when the webhook never arrives —
+ * confirms the payment actually went through and credits the wallet when it did. */
+async function checkCollectionStatus(marzUuid) {
+  const res = await fetch(MARZ_BASE + "/collect-money/" + encodeURIComponent(marzUuid), {
+    headers: { Authorization: MARZ_AUTH, Accept: "application/json" }
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data) return null;
+  const status = String((data.data && data.data.transaction && data.data.transaction.status) || "").toLowerCase();
+  return { status, raw: data };
+}
+
 /* ---------------- app ---------------- */
 const app = express();
 
@@ -287,12 +300,15 @@ app.post("/api/collect", async (req, res) => {
 
   const provider = (marzData.data && marzData.data.collection && marzData.data.collection.provider) || channel || "mtn";
   const mode = (marzData.data && marzData.data.collection && marzData.data.collection.mode) || "";
+  const marzUuid = (marzData.data && marzData.data.transaction && marzData.data.transaction.uuid) || "";
   await txRef.update({
     channel: provider === "airtel" ? "airtel" : "mtn",
-    marzUuid: (marzData.data && marzData.data.transaction && marzData.data.transaction.uuid) || "",
+    marzUuid,
     providerMode: mode || "",
     updatedAt: serverTs()
   }).catch(() => {});
+
+  if (marzUuid) scheduleDepositReconcile(txRef.id, marzUuid);
 
   res.json({
     status: "success",
@@ -372,7 +388,7 @@ async function runDisbursement(txId, phoneOverride) {
     updatedAt: serverTs()
   }).catch(() => {});
 
-  if (marzUuid) scheduleReconcile(txId, marzUuid);
+  scheduleReconcile(txId, marzUuid);
 
   return { txId, marzRef: reference, provider: provider || "mtn" };
 }
@@ -399,11 +415,13 @@ async function resolveWithdrawOutcome(txId, marzUuid, forceApprove) {
   if (t.status !== "processing") return; // webhook (or an earlier check) already resolved it
 
   let result = null;
-  try {
-    result = await checkDisbursementStatus(marzUuid);
-  } catch (e) {
-    console.error("[benz-pay] reconcile status check failed for", txId, e.message);
-    if (!forceApprove) return; // stays processing, will retry on the next sweep
+  if (marzUuid) {
+    try {
+      result = await checkDisbursementStatus(marzUuid);
+    } catch (e) {
+      console.error("[benz-pay] reconcile status check failed for", txId, e.message);
+      if (!forceApprove) return; // stays processing, will retry on the next sweep
+    }
   }
 
   const status = result && result.status;
@@ -480,7 +498,6 @@ function startReconcileSweep() {
         .get();
       for (const doc of snap.docs) {
         const t = doc.data();
-        if (!t.marzUuid) continue;
         const updatedAt = t.updatedAt && t.updatedAt.toDate ? t.updatedAt.toDate() : null;
         if (updatedAt && updatedAt > cutoff) continue; // too recent, give the webhook more time
         // force=true here too: normally the 60s one-shot (scheduleReconcile) already
@@ -495,6 +512,100 @@ function startReconcileSweep() {
         console.error("[benz-pay] reconcile sweep needs a Firestore composite index (type + status). Create it using the link Firestore includes in this error, then the sweep will start working:", e.message);
       } else {
         console.error("[benz-pay] reconcile sweep failed:", e.message);
+      }
+    }
+  }, 2 * 60 * 1000);
+}
+
+/* Resolve an automatic deposit still at "pending" — used when the MarzPay webhook
+ * hasn't arrived. Actively checks the real collection status with MarzPay and credits
+ * the wallet + marks it approved (webhook-equivalent) when MarzPay confirms the payment
+ * went through, or marks it rejected when MarzPay reports failure. Unlike withdrawals,
+ * deposits are never force-credited without evidence: if MarzPay has no definitive
+ * answer we leave it "pending" and the recurring sweep simply keeps retrying until the
+ * collection reaches a final state. No admin approval is involved for automatic mode. */
+async function resolveDepositOutcome(txId, marzUuid) {
+  const txRef = db.collection("transactions").doc(txId);
+  const snap = await txRef.get();
+  if (!snap.exists) return;
+  const t = snap.data();
+  if (t.type !== "deposit" || t.mode !== "auto") return;
+  if (t.status !== "pending") return; // webhook (or an earlier check) already resolved it
+
+  let result = null;
+  try {
+    result = await checkCollectionStatus(marzUuid);
+  } catch (e) {
+    console.error("[benz-pay] deposit reconcile status check failed for", txId, e.message);
+    return; // stays pending, will retry on the next sweep
+  }
+
+  const status = result && result.status;
+  const success = status ? /completed|successful|sandbox/i.test(status) : false;
+  const failed = status ? /failed|cancelled|canceled|rejected/i.test(status) : false;
+  if (!success && !failed) return; // still pending / unknown on MarzPay's side — retry later
+
+  if (success) {
+    await db.runTransaction(async (tx) => {
+      const cur = await tx.get(txRef);
+      if (!cur.exists) return;
+      const c = cur.data();
+      if (c.status !== "pending") return;
+      const wRef = db.collection("wallets").doc(c.userId);
+      const w = await tx.get(wRef);
+      const bal = w.exists ? (w.data().balance || 0) : 0;
+      if (w.exists) tx.update(wRef, { balance: ROUND(bal + c.amount), updatedAt: serverTs() });
+      else tx.set(wRef, { balance: ROUND(c.amount), updatedAt: serverTs() });
+      tx.update(txRef, { status: "approved", note: (c.note || "Mobile money deposit") + " (confirmed via status check)", updatedAt: serverTs() });
+    });
+    notify(t.userId, "Deposit received", fmtAmount(t.amount) + " was added to your wallet automatically.", "finance", "wallet.html");
+  } else {
+    await db.runTransaction(async (tx) => {
+      const cur = await tx.get(txRef);
+      if (!cur.exists) return;
+      const c = cur.data();
+      if (c.status !== "pending") return;
+      tx.update(txRef, { status: "rejected", note: "Payment was not completed.", updatedAt: serverTs() });
+    });
+    notify(t.userId, "Deposit not received", "Your deposit of " + fmtAmount(t.amount) + " was not completed. Try again or use a manual channel.", "ban", "wallet.html");
+  }
+}
+
+/* Check a not-yet-credited automatic deposit ~60s after it was created, in case the
+ * webhook never shows up. If MarzPay confirms the payment by then, the wallet is
+ * credited right away — no admin step needed. */
+function scheduleDepositReconcile(txId, marzUuid) {
+  setTimeout(() => {
+    resolveDepositOutcome(txId, marzUuid).catch((e) => console.error("[benz-pay] deposit reconcile error:", e.message));
+  }, 60 * 1000);
+}
+
+/* Safety-net sweep: every 2 minutes, re-check any automatic deposit still at "pending"
+ * for more than 60 seconds (covers cases where the one-shot timer was lost to a server
+ * restart, or the user paid after the first check). Credits the wallet as soon as
+ * MarzPay reports the payment succeeded. Shipped with Firebase + MarzPay configured. */
+function startDepositReconcileSweep() {
+  if (!firebaseReady || !MARZ_AUTH) return;
+  setInterval(async () => {
+    try {
+      const cutoff = new Date(Date.now() - 60 * 1000);
+      const snap = await db.collection("transactions")
+        .where("type", "==", "deposit")
+        .where("status", "==", "pending")
+        .get();
+      for (const doc of snap.docs) {
+        const t = doc.data();
+        if (t.mode !== "auto") continue;
+        if (!t.marzUuid) continue;
+        const updatedAt = t.updatedAt && t.updatedAt.toDate ? t.updatedAt.toDate() : null;
+        if (updatedAt && updatedAt > cutoff) continue; // too recent, give the webhook more time
+        await resolveDepositOutcome(doc.id, t.marzUuid).catch((e) => console.error("[benz-pay] deposit sweep reconcile error:", e.message));
+      }
+    } catch (e) {
+      if (/index/i.test(e.message)) {
+        console.error("[benz-pay] deposit reconcile sweep needs a Firestore composite index (type + status). Create it using the link Firestore includes in this error, then the sweep will start working:", e.message);
+      } else {
+        console.error("[benz-pay] deposit reconcile sweep failed:", e.message);
       }
     }
   }, 2 * 60 * 1000);
@@ -705,4 +816,5 @@ app.listen(PORT, () => {
   console.log("[benz-pay] payments server listening on port " + PORT);
   console.log("[benz-pay] webhook endpoint: " + (PUBLIC_BASE_URL || "CALLBACK_URL_NOT_SET") + "/api/webhook");
   startReconcileSweep();
+  startDepositReconcileSweep();
 });
