@@ -1,4 +1,4 @@
-Benz assets payments server.
+/Benz assets payments server.
  *
  * Bridges the client app to MarzPay (https://wallet.wearemarz.com) for
  * MTN Mobile Money / Airtel Money collections (deposits) and disbursements
