@@ -1,16 +1,19 @@
 {
-  "name": "benz-assets-pay",
+  "name": "benz-assets-payments-server",
   "version": "1.0.0",
-  "description": "MarzPay (MTN/Airtel Money) collections and disbursements for Benz Assets.",
+  "description": "Payments server for Benz Assets wallet — PesaJet Pay (MTN + Airtel mobile money) collections, disbursements and webhooks.",
   "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
+    "@pesajet/sdk": "^1.0.0",
+    "cors": "^2.8.5",
     "express": "^4.19.2",
-    "firebase-admin": "^12.3.0"
+    "firebase-admin": "^12.1.0"
   }
 }
