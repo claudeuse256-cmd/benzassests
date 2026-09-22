@@ -22,8 +22,9 @@
  *   PESAJET_BASE_URL          Default https://payments.pesajet.com/api/v1
  *
  *   NAME_LOOKUP_BASE_URL      Base URL of the internal name-lookup provider
- *   NAME_LOOKUP_KEY           API key / secret for the name-lookup provider
- *                             (both blank => the feature is silently disabled
+ *   NAME_LOOKUP_ID            Account/API-key identifier for the name-lookup provider
+ *   NAME_LOOKUP_SECRET        Secret for the name-lookup provider
+ *                             (any blank => the feature is silently disabled
  *                             and the app is told to skip verification)
  *
  *   ADMIN_API_KEY             Secret header (X-Admin-Key) required for /api/disburse
@@ -61,7 +62,8 @@ const PESAJET_WEBHOOK_SECRET = process.env.PESAJET_WEBHOOK_SECRET || "";
 // Internal name-lookup provider. Deliberately generic — never named in any
 // client-facing response, log line the frontend could see, or error message.
 const NAME_LOOKUP_BASE_URL = (process.env.NAME_LOOKUP_BASE_URL || "").replace(/\/+$/, "");
-const NAME_LOOKUP_KEY = process.env.NAME_LOOKUP_KEY || "";
+const NAME_LOOKUP_ID = process.env.NAME_LOOKUP_ID || "";
+const NAME_LOOKUP_SECRET = process.env.NAME_LOOKUP_SECRET || "";
 
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || "change-me-admin-key";
 const CURRENCY = process.env.PESAJET_CURRENCY || "UGX";
@@ -74,7 +76,7 @@ if (ADMIN_API_KEY === "change-me-admin-key") {
 if (!PESAJET_API_KEY) {
   console.warn("[benz-pay] WARNING: PESAJET_API_KEY not set. Payment calls will fail until configured.");
 }
-if (!NAME_LOOKUP_BASE_URL || !NAME_LOOKUP_KEY) {
+if (!NAME_LOOKUP_BASE_URL || !NAME_LOOKUP_ID || !NAME_LOOKUP_SECRET) {
   console.warn("[benz-pay] NOTE: name-lookup provider not configured. /api/verify-name will report the feature as unavailable, and the wallet UI should let withdrawals proceed without it.");
 }
 
@@ -142,7 +144,7 @@ function providerOf(phoneOrProvider) {
  * Deliberately kept generic in naming, logging and error text — the app and
  * its users should never see which service actually answers this. */
 async function lookupRegisteredName(phone) {
-  if (!NAME_LOOKUP_BASE_URL || !NAME_LOOKUP_KEY) {
+  if (!NAME_LOOKUP_BASE_URL || !NAME_LOOKUP_ID || !NAME_LOOKUP_SECRET) {
     const err = new Error("Recipient name verification is not available right now.");
     err.code = "UNAVAILABLE";
     throw err;
@@ -150,7 +152,7 @@ async function lookupRegisteredName(phone) {
   const r = await fetch(NAME_LOOKUP_BASE_URL + "/phone-verification/verify", {
     method: "POST",
     headers: {
-      Authorization: "Basic " + Buffer.from(NAME_LOOKUP_KEY).toString("base64"),
+      Authorization: "Basic " + Buffer.from(NAME_LOOKUP_ID + ":" + NAME_LOOKUP_SECRET).toString("base64"),
       "Content-Type": "application/json",
       Accept: "application/json"
     },
@@ -752,7 +754,14 @@ app.post("/api/webhook", express.json({ limit: "1mb" }), async (req, res) => {
       return res.status(200).json({ received: true, matched: true, final: true });
     }
 
-    const recvAmount = ROUND(body.amount != null ? body.amount : t.amount);
+    // Always credit/report the amount WE recorded when the transaction was created
+    // (what the user typed into the app), never whatever figure the provider echoes
+    // back in the webhook. If a provider fee is configured to be added on top and
+    // charged to the payer, the webhook's amount can be higher than what the user
+    // intended to deposit — that difference is the provider's fee and must never
+    // reach the wallet. Using our own record keeps the wallet exact regardless of
+    // how the provider's fee is configured.
+    const recvAmount = ROUND(t.amount);
     const isDeposit = t.type === "deposit";
     const isWithdraw = t.type === "withdraw";
 
@@ -823,4 +832,3 @@ app.listen(PORT, () => {
   startReconcileSweep();
   startDepositReconcileSweep();
 });
-
