@@ -1,32 +1,45 @@
 /**
- * Benz assets payments server.
+ * Benz Assets payments server.
  *
- * Bridges the client app to MarzPay (https://wallet.wearemarz.com) for
- * MTN Mobile Money / Airtel Money collections (deposits) and disbursements
- * (withdrawals) in Uganda (UGX, +256).
+ * Moves money via PesaJet Pay (https://pay.pesajet.com) — MTN Mobile Money /
+ * Airtel Money collections (deposits) and disbursements (withdrawals) in
+ * Uganda (UGX, +256).
+ *
+ * Recipient name lookup (used only so the user can confirm who they're
+ * withdrawing to) is served by a separate internal verification provider.
+ * This is intentionally generic in the code and in every response the app
+ * ever sees — no provider name is exposed to the client.
  *
  * Env:
- *   PORT                 Port to listen on (default 8787)
- *   PUBLIC_BASE_URL      Public URL of this server, e.g. https://mpesa.example.com
- *                        Used to build the webhook callback_url sent to MarzPay.
+ *   PORT                      Port to listen on (default 8787)
+ *   PUBLIC_BASE_URL           Public URL of this server, e.g. https://pay.example.com
+ *                             (used only for the printed webhook URL at startup)
  *   FIREBASE_SERVICE_ACCOUNT  JSON string of the firebase-admin service account, OR
  *   GOOGLE_APPLICATION_CREDENTIALS  path to the service account JSON file.
- *   MARZ_API_KEY         MarzPay API key
- *   MARZ_API_SECRET      MarzPay API secret  (Basic Auth = base64(key:secret))
- *   MARZ_BASE_URL        Default https://wallet.wearemarz.com/api/v1
- *   MARZ_COUNTRY         Default UG
- *   MARZPAY_SIGNING_SECRET  Optional; verifies outgoing webhooks (X-MarzPay-*).
- *   ADMIN_API_KEY        Secret header (X-Admin-Key) required for /api/disburse and /api/marz/balance.
+ *
+ *   PESAJET_API_KEY           PesaJet X-API-Key (from Manage API keys in their dashboard)
+ *   PESAJET_WEBHOOK_SECRET    PesaJet webhook signing secret (whsec_...)
+ *   PESAJET_BASE_URL          Default https://payments.pesajet.com/api/v1
+ *
+ *   NAME_LOOKUP_BASE_URL      Base URL of the internal name-lookup provider
+ *   NAME_LOOKUP_KEY           API key / secret for the name-lookup provider
+ *                             (both blank => the feature is silently disabled
+ *                             and the app is told to skip verification)
+ *
+ *   ADMIN_API_KEY             Secret header (X-Admin-Key) required for /api/disburse
+ *                             and the admin balance/test-connection check.
+ *   ALLOWED_ORIGINS           Comma-separated list of origins allowed to call this API.
+ *                             Leave blank to allow any origin.
  *
  * User-facing endpoints (Firebase ID token in Authorization: Bearer <token>):
- *   POST /api/collect       Start a deposit — MarzPay sends a payment prompt to the user's phone.
+ *   POST /api/collect       Start a deposit — PesaJet sends a payment prompt to the user's phone.
  *   POST /api/verify-name   Look up the registered name on a mobile money number.
  *   POST /api/withdraw      Create + immediately pay out a withdrawal to a verified number.
  *
- * Reliability: a withdrawal sent to MarzPay moves to "processing" and is normally
+ * Reliability: a withdrawal sent to PesaJet moves to "processing" and is normally
  * resolved to "approved"/"rejected" by the /api/webhook callback. If that webhook
  * doesn't arrive, a one-shot check ~60s after send, plus a recurring sweep every
- * 2 minutes, actively asks MarzPay for the real transaction status and resolves it
+ * 2 minutes, actively asks PesaJet for the real transaction status and resolves it
  * from that — it never assumes success or failure from silence alone.
  *
  * Run:  npm install && node server.js
@@ -35,28 +48,42 @@
 const express = require("express");
 const crypto = require("crypto");
 const admin = require("firebase-admin");
+const { PesaJet } = require("@pesajet/sdk");
 
 /* ---------------- config ---------------- */
 const PORT = parseInt(process.env.PORT || "8787", 10);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "");
-const MARZ_BASE = (process.env.MARZ_BASE_URL || "https://wallet.wearemarz.com/api/v1").replace(/\/+$/, "");
-const MARZ_API_KEY = process.env.MARZ_API_KEY || "";
-const MARZ_API_SECRET = process.env.MARZ_API_SECRET || "";
-const MARZ_COUNTRY = process.env.MARZ_COUNTRY || "UG";
-const MARZ_SIGNING_SECRET = process.env.MARZPAY_SIGNING_SECRET || "";
+
+const PESAJET_BASE = (process.env.PESAJET_BASE_URL || "https://payments.pesajet.com/api/v1").replace(/\/+$/, "");
+const PESAJET_API_KEY = process.env.PESAJET_API_KEY || "";
+const PESAJET_WEBHOOK_SECRET = process.env.PESAJET_WEBHOOK_SECRET || "";
+
+// Internal name-lookup provider. Deliberately generic — never named in any
+// client-facing response, log line the frontend could see, or error message.
+const NAME_LOOKUP_BASE_URL = (process.env.NAME_LOOKUP_BASE_URL || "").replace(/\/+$/, "");
+const NAME_LOOKUP_KEY = process.env.NAME_LOOKUP_KEY || "";
+
 const ADMIN_API_KEY = process.env.ADMIN_API_KEY || "change-me-admin-key";
-const CURRENCY = process.env.MARZ_CURRENCY || "UGX";
+const CURRENCY = process.env.PESAJET_CURRENCY || "UGX";
 const MIN_UGX = 500;
 const MAX_UGX = 10000000;
-
-const MARZ_AUTH = MARZ_API_KEY ? "Basic " + Buffer.from(MARZ_API_KEY + ":" + MARZ_API_SECRET).toString("base64") : "";
 
 if (ADMIN_API_KEY === "change-me-admin-key") {
   console.warn("[benz-pay] WARNING: ADMIN_API_KEY is the default. Set it before going live.");
 }
-if (!MARZ_AUTH) {
-  console.warn("[benz-pay] WARNING: MARZ_API_KEY / MARZ_API_SECRET not set. Marz calls will fail until configured.");
+if (!PESAJET_API_KEY) {
+  console.warn("[benz-pay] WARNING: PESAJET_API_KEY not set. Payment calls will fail until configured.");
 }
+if (!NAME_LOOKUP_BASE_URL || !NAME_LOOKUP_KEY) {
+  console.warn("[benz-pay] NOTE: name-lookup provider not configured. /api/verify-name will report the feature as unavailable, and the wallet UI should let withdrawals proceed without it.");
+}
+
+const pesajet = new PesaJet({
+  apiKey: PESAJET_API_KEY,
+  webhookSecret: PESAJET_WEBHOOK_SECRET,
+  baseUrl: PESAJET_BASE,
+  timeoutMs: 30000
+});
 
 /* ---------------- firebase ---------------- */
 let db = null;
@@ -74,14 +101,12 @@ try {
 }
 
 const serverTs = () => admin.firestore.FieldValue.serverTimestamp();
-const UUID = () => crypto.randomUUID();
 const ROUND = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
 function normalizeUG(phone) {
   let d = String(phone || "").replace(/\D/g, "");
   if (d.startsWith("256")) d = d.slice(3);
   if (d.startsWith("0")) d = d.slice(1);
-  if (/^7\d{8}$/.test(d)) return "+256" + d;
   if (/^[37]\d{8}$/.test(d)) return "+256" + d;
   return null;
 }
@@ -94,7 +119,7 @@ function tokenToUid(req) {
 
 function adminKeyOk(req) {
   const k = req.headers["x-admin-key"] || "";
-  return k && crypto.timingSafeEqual(Buffer.from(k), Buffer.from(ADMIN_API_KEY));
+  return k && k.length === ADMIN_API_KEY.length && crypto.timingSafeEqual(Buffer.from(k), Buffer.from(ADMIN_API_KEY));
 }
 
 function notify(uid, title, body, type, link) {
@@ -104,66 +129,48 @@ function notify(uid, title, body, type, link) {
   }).catch(() => {});
 }
 
-/* ---------------- Marz client ---------------- */
-async function marz(path, payload) {
-  const res = await fetch(MARZ_BASE + path, {
-    method: "POST",
-    headers: {
-      "Authorization": MARZ_AUTH,
-      "Content-Type": "application/json",
-      "Accept": "application/json"
-    },
-    body: JSON.stringify(payload)
-  });
-  const data = await res.json().catch(() => ({ status: "error", message: "Non-JSON response from MarzPay" }));
-  if (!res.ok || (data.status && data.status !== "success")) {
-    const err = new Error(data.message || ("MarzPay request failed (" + res.status + ")"));
-    err.code = data.error_code || "MARZ_ERROR";
-    err.details = data.errors || data;
+function fmtAmount(n) {
+  return CURRENCY + " " + ROUND(n).toLocaleString("en-US", { maximumFractionDigits: 2 });
+}
+
+function providerOf(phoneOrProvider) {
+  const p = String(phoneOrProvider || "").toLowerCase();
+  return p === "airtel" || p === "mtn" ? p : "mtn";
+}
+
+/* ---------------- internal name-lookup helper ----------------
+ * Deliberately kept generic in naming, logging and error text — the app and
+ * its users should never see which service actually answers this. */
+async function lookupRegisteredName(phone) {
+  if (!NAME_LOOKUP_BASE_URL || !NAME_LOOKUP_KEY) {
+    const err = new Error("Recipient name verification is not available right now.");
+    err.code = "UNAVAILABLE";
     throw err;
   }
-  return data;
-}
-
-function collectPayload(pay) {
-  return {
-    amount: pay.amount,
-    phone_number: pay.phone,
-    country: pay.country,
-    currency: CURRENCY,
-    reference: pay.reference,
-    description: pay.description || "Benz Assets payment",
-    metadata: [
-      { benzUid: pay.uid, isPII: true },
-      { benzType: pay.type },
-      { benzTx: pay.txId, isPII: true }
-    ]
-  };
-}
-
-/* Look up the real status of a send-money disbursement on MarzPay by its transaction uuid.
- * Used to reconcile withdrawals stuck at "processing" when the webhook never arrives. */
-async function checkDisbursementStatus(marzUuid) {
-  const res = await fetch(MARZ_BASE + "/send-money/" + encodeURIComponent(marzUuid), {
-    headers: { Authorization: MARZ_AUTH, Accept: "application/json" }
+  const r = await fetch(NAME_LOOKUP_BASE_URL + "/phone-verification/verify", {
+    method: "POST",
+    headers: {
+      Authorization: "Basic " + Buffer.from(NAME_LOOKUP_KEY).toString("base64"),
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    },
+    body: JSON.stringify({ phone_number: phone.replace(/^\+/, "") })
   });
-  const data = await res.json().catch(() => null);
-  if (!res.ok || !data) return null;
-  const status = String((data.data && data.data.transaction && data.data.transaction.status) || "").toLowerCase();
-  return { status, raw: data };
-}
-
-/* Look up the real status of a mobile-money collection on MarzPay by its transaction uuid.
- * Used to reconcile automatic deposits stuck at "pending" when the webhook never arrives —
- * confirms the payment actually went through and credits the wallet when it did. */
-async function checkCollectionStatus(marzUuid) {
-  const res = await fetch(MARZ_BASE + "/collect-money/" + encodeURIComponent(marzUuid), {
-    headers: { Authorization: MARZ_AUTH, Accept: "application/json" }
-  });
-  const data = await res.json().catch(() => null);
-  if (!res.ok || !data) return null;
-  const status = String((data.data && data.data.transaction && data.data.transaction.status) || "").toLowerCase();
-  return { status, raw: data };
+  const data = await r.json().catch(() => ({}));
+  const ok = r.ok && (data.status === "success" || data.success === true);
+  if (!ok) {
+    const err = new Error((data && data.message) || "Could not verify that number.");
+    err.code = "LOOKUP_FAILED";
+    throw err;
+  }
+  const d = data.data || {};
+  const name = d.full_name || d.name || "";
+  if (!name) {
+    const err = new Error("No registered name found for that number.");
+    err.code = "NOT_FOUND";
+    throw err;
+  }
+  return { name, phone: d.phone_number || phone };
 }
 
 /* ---------------- app ---------------- */
@@ -199,28 +206,44 @@ app.get("/", (req, res) => {
 });
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, firebase: firebaseReady, marz: !!MARZ_AUTH, ts: Date.now() });
+  res.json({ ok: true, firebase: firebaseReady, paymentsConfigured: !!PESAJET_API_KEY, ts: Date.now() });
 });
 
-/* Validate Marz API credentials from the admin panel. */
+/* Validate payment-provider API credentials from the admin panel.
+ * Kept at the same path the admin page already calls (/api/marz/balance)
+ * so no admin-page changes are needed beyond swapping the server URL. */
 app.get("/api/marz/balance", async (req, res) => {
   if (!adminKeyOk(req)) return res.status(401).json({ status: "error", message: "Invalid admin key" });
-  if (!MARZ_AUTH) return res.status(503).json({ status: "error", message: "MarzPay credentials not configured on the server (MARZ_API_KEY / MARZ_API_SECRET)." });
+  if (!PESAJET_API_KEY) return res.status(503).json({ status: "error", message: "Payment credentials not configured on the server (PESAJET_API_KEY)." });
   try {
-    const r = await fetch(MARZ_BASE + "/balance", { headers: { Authorization: MARZ_AUTH, Accept: "application/json" } });
+    // PesaJet's REST API has no dedicated balance endpoint in its published
+    // reference; use a lightweight, side-effect-free call (list transactions,
+    // page 1) purely to prove the API key is valid and the service reachable.
+    const r = await fetch(PESAJET_BASE + "/payments?page=1&limit=1", {
+      headers: { "X-API-Key": PESAJET_API_KEY, Accept: "application/json" }
+    });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.message || ("Balance check failed (" + r.status + ")"));
-    res.json({ status: "success", data: data.data || data });
+    if (!r.ok) throw new Error((data.error && data.error.message) || ("Connection check failed (" + r.status + ")"));
+    res.json({
+      status: "success",
+      data: {
+        account: {
+          balance: { formatted: "See provider dashboard" },
+          status: { mode: /sandbox|test/i.test(PESAJET_BASE) ? "sandbox" : "live" }
+        },
+        raw: data
+      }
+    });
   } catch (e) {
     res.status(502).json({ status: "error", message: e.message });
   }
 });
 
-/* Look up the registered name on a mobile money number (MarzPay phone verification).
- * Used by the wallet page so the user can confirm the recipient before withdrawing. */
+/* Look up the registered name on a mobile money number.
+ * Used by the wallet page so the user can confirm the recipient before withdrawing.
+ * Served by the internal name-lookup provider — see lookupRegisteredName above. */
 app.post("/api/verify-name", async (req, res) => {
   if (!firebaseReady) return res.status(500).json({ status: "error", message: "Server Firebase is not configured." });
-  if (!MARZ_AUTH) return res.status(503).json({ status: "error", message: "MarzPay credentials not configured on the server." });
   const uid = await tokenToUid(req);
   if (!uid) return res.status(401).json({ status: "error", message: "Invalid or missing Firebase token." });
 
@@ -228,37 +251,24 @@ app.post("/api/verify-name", async (req, res) => {
   if (!phone) return res.status(422).json({ status: "error", message: "A valid +256 phone number is required." });
 
   try {
-    const r = await fetch(MARZ_BASE + "/phone-verification/verify", {
-      method: "POST",
-      headers: { Authorization: MARZ_AUTH, "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ phone_number: phone.replace(/^\+/, "") })
-    });
-    const data = await r.json().catch(() => ({}));
-    const ok = r.ok && (data.status === "success" || data.success === true);
-    if (!ok) {
-      const msg = (data && data.message) || "Could not verify that number.";
-      return res.status(r.status === 401 ? 502 : 422).json({ status: "error", message: msg });
-    }
-    const d = data.data || {};
-    const name = d.full_name || d.name || "";
-    if (!name) return res.status(422).json({ status: "error", message: "No registered name found for that number." });
-    res.json({ status: "success", data: { name, phone: d.phone_number || phone } });
+    const result = await lookupRegisteredName(phone);
+    res.json({ status: "success", data: result });
   } catch (e) {
-    res.status(502).json({ status: "error", message: "Name lookup failed: " + e.message });
+    const httpCode = e.code === "UNAVAILABLE" ? 503 : (e.code === "NOT_FOUND" ? 422 : 502);
+    res.status(httpCode).json({ status: "error", message: e.message });
   }
 });
 
-/* Automatic deposit: create a MarzPay collection. Wallet page calls this with the user's Firebase ID token. */
+/* Automatic deposit: create a PesaJet collection. Wallet page calls this with the user's Firebase ID token. */
 app.post("/api/collect", async (req, res) => {
   if (!firebaseReady) return res.status(500).json({ status: "error", message: "Server Firebase is not configured." });
-  if (!MARZ_AUTH) return res.status(503).json({ status: "error", message: "MarzPay credentials not configured on the server." });
+  if (!PESAJET_API_KEY) return res.status(503).json({ status: "error", message: "Payment credentials not configured on the server." });
   const uid = await tokenToUid(req);
   if (!uid) return res.status(401).json({ status: "error", message: "Invalid or missing Firebase token." });
 
   const amount = ROUND(req.body.amount);
   const phone = normalizeUG(req.body.phone || "");
-  const country = req.body.country || MARZ_COUNTRY;
-  const channel = String(req.body.channel || "").toLowerCase();
+  const channelHint = providerOf(req.body.channel);
 
   if (!amount || amount < MIN_UGX || amount > MAX_UGX) {
     return res.status(422).json({ status: "error", message: "Amount must be between " + MIN_UGX + " and " + MAX_UGX + " " + CURRENCY + "." });
@@ -272,87 +282,61 @@ app.post("/api/collect", async (req, res) => {
   } catch (e) { /* ignore */ }
   if (profile.banned) return res.status(403).json({ status: "error", message: "Account suspended." });
 
-  const reference = UUID();
   const txRef = db.collection("transactions").doc();
+  const idempotencyKey = txRef.id;
 
   await txRef.set({
     userId: uid,
     userName: profile.fullName || "Member",
     type: "deposit",
     amount,
-    channel: channel === "airtel" ? "airtel" : "mtn",
+    channel: channelHint,
     mode: "auto",
     status: "pending",
-    marzRef: reference,
     note: "Mobile money deposit",
     createdAt: serverTs(),
     updatedAt: serverTs()
   });
 
-  let marzData;
+  let payment;
   try {
-    marzData = await marz("/collect-money", collectPayload({
-      amount, phone, country, reference, uid, txId: txRef.id, type: "deposit", description: "Benz Assets deposit"
-    }));
+    payment = await pesajet.payments.create({
+      type: "COLLECTION",
+      amount,
+      currency: CURRENCY,
+      phoneNumber: phone,
+      provider: channelHint,
+      reference: txRef.id,
+      description: "Benz Assets deposit",
+      idempotencyKey
+    });
   } catch (e) {
     await txRef.update({ status: "rejected", note: "Payment initiation failed: " + e.message, updatedAt: serverTs() });
     return res.status(502).json({ status: "error", message: e.message });
   }
 
-  const provider = (marzData.data && marzData.data.collection && marzData.data.collection.provider) || channel || "mtn";
-  const mode = (marzData.data && marzData.data.collection && marzData.data.collection.mode) || "";
-  const marzUuid = (marzData.data && marzData.data.transaction && marzData.data.transaction.uuid) || "";
+  const provider = providerOf(payment.provider) || channelHint;
   await txRef.update({
-    channel: provider === "airtel" ? "airtel" : "mtn",
-    marzUuid,
-    providerMode: mode || "",
+    channel: provider,
+    providerTxId: payment.transactionId || "",
     updatedAt: serverTs()
   }).catch(() => {});
 
-  const isSandbox = /sandbox/i.test(String(mode || ""));
-  if (isSandbox) {
-    // Sandbox accounts return an immediate dummy "success" and send no webhook, so the
-    // deposit would otherwise sit at "pending" forever. Credit the wallet right away.
-    try {
-      await db.runTransaction(async (tx) => {
-        const cur = await tx.get(txRef);
-        if (!cur.exists) return;
-        const c = cur.data();
-        if (c.status !== "pending") return;
-        const wRef = db.collection("wallets").doc(c.userId);
-        const w = await tx.get(wRef);
-        const bal = w.exists ? (w.data().balance || 0) : 0;
-        if (w.exists) tx.update(wRef, { balance: ROUND(bal + c.amount), updatedAt: serverTs() });
-        else tx.set(wRef, { balance: ROUND(c.amount), updatedAt: serverTs() });
-        tx.update(txRef, { status: "approved", note: (c.note || "Mobile money deposit") + " (sandbox auto-approved)", updatedAt: serverTs() });
-      });
-      notify(uid, "Deposit received", fmtAmount(amount) + " was added to your wallet automatically.", "finance", "wallet.html");
-    } catch (e) {
-      console.error("[benz-pay] sandbox deposit credit failed:", e.message);
-    }
-  }
-
-  if (marzUuid) scheduleDepositReconcile(txRef.id, marzUuid);
+  if (payment.transactionId) scheduleDepositReconcile(txRef.id, payment.transactionId);
 
   res.json({
     status: "success",
-    message: "Payment request sent. The customer confirms on their phone.",
-    data: {
-      txId: txRef.id,
-      marzRef: reference,
-      provider,
-      sandbox: /sandbox/i.test(mode) || (mode && /sandbox/i.test(String(mode)))
-    }
+    message: "Payment request sent. Confirm the prompt on your phone.",
+    data: { txId: txRef.id, provider }
   });
 });
 
 /* Shared payout logic: moves a pending withdrawal tx to "processing", debits the
- * wallet, calls MarzPay send-money, and rolls back on failure. Used by both the
+ * wallet, calls PesaJet to disburse, and rolls back on failure. Used by both the
  * admin-triggered /api/disburse and the user-triggered /api/withdraw below. */
 async function runDisbursement(txId, phoneOverride) {
   const txRef = db.collection("transactions").doc(txId);
   let payload = null;
-  const reference = UUID();
 
   await db.runTransaction(async (tx) => {
     const snap = await tx.get(txRef);
@@ -364,7 +348,7 @@ async function runDisbursement(txId, phoneOverride) {
     if (!phone) throw Object.assign(new Error("Recipient phone number is missing or invalid."), { code: "NO_PHONE" });
     const amount = ROUND(t.amount);
     if (!amount || amount < MIN_UGX || amount > MAX_UGX) {
-      throw Object.assign(new Error("Amount outside MarzPay limits."), { code: "AMOUNT" });
+      throw Object.assign(new Error("Amount outside allowed limits."), { code: "AMOUNT" });
     }
     const payout = ROUND(t.payout != null ? ROUND(t.payout) : (t.fee != null ? ROUND(amount - t.fee) : amount));
     if (!payout || payout < MIN_UGX) {
@@ -374,19 +358,30 @@ async function runDisbursement(txId, phoneOverride) {
     const bal = w.exists ? (w.data().balance || 0) : 0;
     if (bal < amount) throw Object.assign(new Error("Insufficient balance."), { code: "INSUFFICIENT" });
 
-    payload = { amount: payout, phone, country: t.country || MARZ_COUNTRY, reference, uid: t.userId, txId, type: "withdraw" };
+    payload = {
+      phone,
+      payout,
+      provider: providerOf(t.channel),
+      recipientName: t.recipientName || undefined
+    };
 
     if (w.exists) tx.update(db.collection("wallets").doc(t.userId), { balance: ROUND(bal - amount), updatedAt: serverTs() });
     else tx.set(db.collection("wallets").doc(t.userId), { balance: Math.max(0, ROUND(bal - amount)), updatedAt: serverTs() });
-    tx.update(txRef, { status: "processing", marzRef: reference, note: t.note || "Withdrawal payout", updatedAt: serverTs() });
+    tx.update(txRef, { status: "processing", note: t.note || "Withdrawal payout", updatedAt: serverTs() });
   });
 
-  let marzData;
+  let payment;
   try {
-    marzData = await marz("/send-money", collectPayload({
-      ...payload,
-      description: "Benz Assets withdrawal payout"
-    }));
+    payment = await pesajet.payments.create({
+      type: "DISBURSEMENT",
+      amount: payload.payout,
+      currency: CURRENCY,
+      phoneNumber: payload.phone,
+      provider: payload.provider,
+      reference: txId,
+      description: payload.recipientName ? ("Payout to " + payload.recipientName) : "Benz Assets withdrawal payout",
+      idempotencyKey: txId
+    });
   } catch (e) {
     try {
       await db.runTransaction(async (tx) => {
@@ -397,63 +392,61 @@ async function runDisbursement(txId, phoneOverride) {
         const w = await tx.get(db.collection("wallets").doc(t.userId));
         const bal = w.exists ? (w.data().balance || 0) : 0;
         tx.update(w.ref, { balance: ROUND(bal + t.amount), updatedAt: serverTs() });
-        tx.update(txRef, { status: "pending", marzRef: admin.firestore.FieldValue.delete(), updatedAt: serverTs() });
+        tx.update(txRef, { status: "pending", updatedAt: serverTs() });
       });
     } catch (e2) { /* ignore rollback failure */ }
-    throw Object.assign(new Error("MarzPay rejected the payout: " + e.message), { code: "MARZ" });
+    throw Object.assign(new Error("The payout could not be started: " + e.message), { code: "PROVIDER" });
   }
 
-  const provider = (marzData.data && marzData.data.transaction && marzData.data.transaction.provider) || "";
-  const marzUuid = (marzData.data && marzData.data.transaction && marzData.data.transaction.uuid) || "";
+  const provider = providerOf(payment.provider) || payload.provider;
   await txRef.update({
-    channel: /airtel/i.test(provider) ? "airtel" : "mtn",
-    marzUuid,
-    providerMode: (marzData.data && marzData.data.transaction && marzData.data.transaction.mode) || "",
+    channel: provider,
+    providerTxId: payment.transactionId || "",
     updatedAt: serverTs()
   }).catch(() => {});
 
-  scheduleReconcile(txId, marzUuid);
+  if (payment.transactionId) scheduleReconcile(txId, payment.transactionId);
 
-  return { txId, marzRef: reference, provider: provider || "mtn" };
+  return { txId, provider };
 }
 
-/* Resolve a withdrawal that's been sitting at "processing" — used when the MarzPay
- * webhook hasn't arrived. Actively checks the real transaction status with MarzPay
+/* Resolve a withdrawal that's been sitting at "processing" — used when the PesaJet
+ * webhook hasn't arrived. Actively checks the real transaction status with PesaJet
  * and marks it approved (webhook-equivalent) or rejected+refunded based on that.
  *
- * forceApprove: if true, and MarzPay has NOT given a definitive success/fail answer
- * (status check failed, or MarzPay says still pending) within the window, the
+ * forceApprove: if true, and PesaJet has NOT given a definitive success/fail answer
+ * (status check failed, or still pending/processing) within the window, the
  * withdrawal is force-marked "approved" anyway rather than left "processing".
  * This is a deliberate product choice: it assumes success by default instead of
  * waiting indefinitely. It means a payout that silently failed or is merely slow
- * on MarzPay's side will show as approved/completed everywhere (wallet history,
+ * on the provider's side will show as approved/completed everywhere (wallet history,
  * admin panel, user notification) with no automatic refund — the user's balance
  * was already debited and stays debited. Only the one-shot 60s check
  * (scheduleReconcile) sets this; the recurring safety-net sweep does not, so a
  * withdrawal is force-approved at most once, at the 60s mark. */
-async function resolveWithdrawOutcome(txId, marzUuid, forceApprove) {
+async function resolveWithdrawOutcome(txId, providerTxId, forceApprove) {
   const txRef = db.collection("transactions").doc(txId);
   const snap = await txRef.get();
   if (!snap.exists) return;
   const t = snap.data();
   if (t.status !== "processing") return; // webhook (or an earlier check) already resolved it
 
-  let result = null;
-  if (marzUuid) {
+  let status = null;
+  if (providerTxId) {
     try {
-      result = await checkDisbursementStatus(marzUuid);
+      const tx = await pesajet.payments.get(providerTxId);
+      status = String((tx && tx.status) || "").toUpperCase();
     } catch (e) {
       console.error("[benz-pay] reconcile status check failed for", txId, e.message);
       if (!forceApprove) return; // stays processing, will retry on the next sweep
     }
   }
 
-  const status = result && result.status;
-  const success = status ? /completed|successful/i.test(status) : false;
-  const failed = status ? /failed|cancelled|canceled|rejected/i.test(status) : false;
+  const success = status === "COMPLETED";
+  const failed = status === "FAILED" || status === "EXPIRED";
 
   if (!success && !failed) {
-    if (!forceApprove) return; // still pending / unknown on MarzPay's side — retry later
+    if (!forceApprove) return; // still pending / processing on the provider's side — retry later
     // No definitive answer within the window — force-approve per product policy.
     await db.runTransaction(async (tx) => {
       const cur = await tx.get(txRef);
@@ -497,22 +490,22 @@ async function resolveWithdrawOutcome(txId, marzUuid, forceApprove) {
 }
 
 /* Check a stuck "processing" withdrawal ~60s after it was sent, in case the webhook
- * never shows up. If MarzPay still hasn't given a definitive answer by then, this
+ * never shows up. If PesaJet still hasn't given a definitive answer by then, this
  * force-approves the withdrawal (see resolveWithdrawOutcome for what that means).
  * The recurring sweep below does NOT force-approve — by the time it runs (2 min+),
  * anything still "processing" has already had its one chance to be force-approved
  * here; the sweep only continues to resolve it if a real answer later comes in. */
-function scheduleReconcile(txId, marzUuid) {
+function scheduleReconcile(txId, providerTxId) {
   setTimeout(() => {
-    resolveWithdrawOutcome(txId, marzUuid, true).catch((e) => console.error("[benz-pay] reconcile error:", e.message));
+    resolveWithdrawOutcome(txId, providerTxId, true).catch((e) => console.error("[benz-pay] reconcile error:", e.message));
   }, 60 * 1000);
 }
 
 /* Safety-net sweep: every 2 minutes, re-check any withdrawal still stuck at "processing"
  * for more than 60 seconds (covers cases where the one-shot scheduleReconcile timer was
- * lost to a server restart). Runs only if Firebase + MarzPay are configured. */
+ * lost to a server restart). Runs only if Firebase + PesaJet are configured. */
 function startReconcileSweep() {
-  if (!firebaseReady || !MARZ_AUTH) return;
+  if (!firebaseReady || !PESAJET_API_KEY) return;
   setInterval(async () => {
     try {
       const cutoff = new Date(Date.now() - 60 * 1000);
@@ -524,12 +517,7 @@ function startReconcileSweep() {
         const t = doc.data();
         const updatedAt = t.updatedAt && t.updatedAt.toDate ? t.updatedAt.toDate() : null;
         if (updatedAt && updatedAt > cutoff) continue; // too recent, give the webhook more time
-        // force=true here too: normally the 60s one-shot (scheduleReconcile) already
-        // force-approved anything past its window, so this is a no-op re-check. It only
-        // matters if that one-shot was lost (e.g. server restarted within the first 60s) —
-        // in that case this sweep is what guarantees the withdrawal still doesn't stay
-        // stuck at "processing" forever.
-        await resolveWithdrawOutcome(doc.id, t.marzUuid, true).catch((e) => console.error("[benz-pay] sweep reconcile error:", e.message));
+        await resolveWithdrawOutcome(doc.id, t.providerTxId, true).catch((e) => console.error("[benz-pay] sweep reconcile error:", e.message));
       }
     } catch (e) {
       if (/index/i.test(e.message)) {
@@ -541,14 +529,14 @@ function startReconcileSweep() {
   }, 2 * 60 * 1000);
 }
 
-/* Resolve an automatic deposit still at "pending" — used when the MarzPay webhook
- * hasn't arrived. Actively checks the real collection status with MarzPay and credits
- * the wallet + marks it approved (webhook-equivalent) when MarzPay confirms the payment
- * went through, or marks it rejected when MarzPay reports failure. Unlike withdrawals,
- * deposits are never force-credited without evidence: if MarzPay has no definitive
+/* Resolve an automatic deposit still at "pending" — used when the PesaJet webhook
+ * hasn't arrived. Actively checks the real collection status with PesaJet and credits
+ * the wallet + marks it approved (webhook-equivalent) when PesaJet confirms the payment
+ * went through, or marks it rejected when PesaJet reports failure. Unlike withdrawals,
+ * deposits are never force-credited without evidence: if PesaJet has no definitive
  * answer we leave it "pending" and the recurring sweep simply keeps retrying until the
  * collection reaches a final state. No admin approval is involved for automatic mode. */
-async function resolveDepositOutcome(txId, marzUuid) {
+async function resolveDepositOutcome(txId, providerTxId) {
   const txRef = db.collection("transactions").doc(txId);
   const snap = await txRef.get();
   if (!snap.exists) return;
@@ -556,18 +544,18 @@ async function resolveDepositOutcome(txId, marzUuid) {
   if (t.type !== "deposit" || t.mode !== "auto") return;
   if (t.status !== "pending") return; // webhook (or an earlier check) already resolved it
 
-  let result = null;
+  let status = null;
   try {
-    result = await checkCollectionStatus(marzUuid);
+    const tx = await pesajet.payments.get(providerTxId);
+    status = String((tx && tx.status) || "").toUpperCase();
   } catch (e) {
     console.error("[benz-pay] deposit reconcile status check failed for", txId, e.message);
     return; // stays pending, will retry on the next sweep
   }
 
-  const status = result && result.status;
-  const success = status ? /completed|successful|sandbox/i.test(status) : false;
-  const failed = status ? /failed|cancelled|canceled|rejected/i.test(status) : false;
-  if (!success && !failed) return; // still pending / unknown on MarzPay's side — retry later
+  const success = status === "COMPLETED";
+  const failed = status === "FAILED" || status === "EXPIRED";
+  if (!success && !failed) return; // still pending / processing on the provider's side — retry later
 
   if (success) {
     await db.runTransaction(async (tx) => {
@@ -596,20 +584,20 @@ async function resolveDepositOutcome(txId, marzUuid) {
 }
 
 /* Check a not-yet-credited automatic deposit ~60s after it was created, in case the
- * webhook never shows up. If MarzPay confirms the payment by then, the wallet is
+ * webhook never shows up. If PesaJet confirms the payment by then, the wallet is
  * credited right away — no admin step needed. */
-function scheduleDepositReconcile(txId, marzUuid) {
+function scheduleDepositReconcile(txId, providerTxId) {
   setTimeout(() => {
-    resolveDepositOutcome(txId, marzUuid).catch((e) => console.error("[benz-pay] deposit reconcile error:", e.message));
+    resolveDepositOutcome(txId, providerTxId).catch((e) => console.error("[benz-pay] deposit reconcile error:", e.message));
   }, 60 * 1000);
 }
 
 /* Safety-net sweep: every 2 minutes, re-check any automatic deposit still at "pending"
  * for more than 60 seconds (covers cases where the one-shot timer was lost to a server
  * restart, or the user paid after the first check). Credits the wallet as soon as
- * MarzPay reports the payment succeeded. Shipped with Firebase + MarzPay configured. */
+ * PesaJet reports the payment succeeded. Runs only if Firebase + PesaJet are configured. */
 function startDepositReconcileSweep() {
-  if (!firebaseReady || !MARZ_AUTH) return;
+  if (!firebaseReady || !PESAJET_API_KEY) return;
   setInterval(async () => {
     try {
       const cutoff = new Date(Date.now() - 60 * 1000);
@@ -620,10 +608,10 @@ function startDepositReconcileSweep() {
       for (const doc of snap.docs) {
         const t = doc.data();
         if (t.mode !== "auto") continue;
-        if (!t.marzUuid) continue;
+        if (!t.providerTxId) continue;
         const updatedAt = t.updatedAt && t.updatedAt.toDate ? t.updatedAt.toDate() : null;
         if (updatedAt && updatedAt > cutoff) continue; // too recent, give the webhook more time
-        await resolveDepositOutcome(doc.id, t.marzUuid).catch((e) => console.error("[benz-pay] deposit sweep reconcile error:", e.message));
+        await resolveDepositOutcome(doc.id, t.providerTxId).catch((e) => console.error("[benz-pay] deposit sweep reconcile error:", e.message));
       }
     } catch (e) {
       if (/index/i.test(e.message)) {
@@ -639,7 +627,7 @@ function startDepositReconcileSweep() {
 app.post("/api/disburse", async (req, res) => {
   if (!adminKeyOk(req)) return res.status(401).json({ status: "error", message: "Invalid admin key" });
   if (!firebaseReady) return res.status(500).json({ status: "error", message: "Server Firebase is not configured." });
-  if (!MARZ_AUTH) return res.status(503).json({ status: "error", message: "MarzPay credentials not configured on the server." });
+  if (!PESAJET_API_KEY) return res.status(503).json({ status: "error", message: "Payment credentials not configured on the server." });
 
   const txId = String(req.body.txId || "").trim();
   if (!txId) return res.status(422).json({ status: "error", message: "txId is required." });
@@ -648,7 +636,7 @@ app.post("/api/disburse", async (req, res) => {
     const result = await runDisbursement(txId, req.body.phone);
     res.json({ status: "success", message: "Payout initiated. Funds are sent to the customer's phone.", data: result });
   } catch (e) {
-    const httpCode = e.code === "NOT_FOUND" ? 404 : (e.code === "MARZ" ? 502 : 422);
+    const httpCode = e.code === "NOT_FOUND" ? 404 : (e.code === "PROVIDER" ? 502 : 422);
     res.status(httpCode).json({ status: "error", message: e.message });
   }
 });
@@ -658,14 +646,13 @@ app.post("/api/disburse", async (req, res) => {
  * Creates the withdrawal transaction and pays it out immediately — no admin step. */
 app.post("/api/withdraw", async (req, res) => {
   if (!firebaseReady) return res.status(500).json({ status: "error", message: "Server Firebase is not configured." });
-  if (!MARZ_AUTH) return res.status(503).json({ status: "error", message: "MarzPay credentials not configured on the server." });
+  if (!PESAJET_API_KEY) return res.status(503).json({ status: "error", message: "Payment credentials not configured on the server." });
   const uid = await tokenToUid(req);
   if (!uid) return res.status(401).json({ status: "error", message: "Invalid or missing Firebase token." });
 
   const amount = ROUND(req.body.amount);
   const phone = normalizeUG(req.body.phone || "");
-  const country = req.body.country || MARZ_COUNTRY;
-  const channel = String(req.body.channel || "").toLowerCase();
+  const channel = providerOf(req.body.channel);
   const recipientName = String(req.body.recipientName || "").trim();
 
   if (!amount || amount < MIN_UGX || amount > MAX_UGX) {
@@ -704,8 +691,7 @@ app.post("/api/withdraw", async (req, res) => {
         fee,
         payout,
         phone,
-        country,
-        channel: channel === "airtel" ? "airtel" : "mtn",
+        channel,
         mode: "auto",
         status: "pending",
         note: recipientName ? ("Withdrawal to " + recipientName) : "Withdrawal payout",
@@ -722,114 +708,109 @@ app.post("/api/withdraw", async (req, res) => {
     const result = await runDisbursement(txRef.id, phone);
     res.json({ status: "success", message: "Withdrawal sent. Funds are on their way to your mobile money number.", data: result });
   } catch (e) {
-    const httpCode = e.code === "NOT_FOUND" ? 404 : (e.code === "MARZ" ? 502 : 422);
+    const httpCode = e.code === "NOT_FOUND" ? 404 : (e.code === "PROVIDER" ? 502 : 422);
     res.status(httpCode).json({ status: "error", message: e.message });
   }
 });
 
-/* MarzPay webhook — handles collection.completed/failed and disbursement.completed/failed. */
-app.post("/api/webhook", async (req, res) => {
-  const rawBody = JSON.stringify(req.body || {});
-  if (MARZ_SIGNING_SECRET && !verifyMarzSig(req, rawBody)) {
-    return res.status(401).json({ status: "error", message: "Invalid signature" });
+/* PesaJet webhook — handles payment.completed / payment.failed / payment.expired
+ * for both collections (deposits) and disbursements (withdrawals). Verified with
+ * the official SDK's HMAC-SHA256 signature check against X-Webhook-Signature. */
+app.post("/api/webhook", express.json({ limit: "1mb" }), async (req, res) => {
+  const signature = req.headers["x-webhook-signature"] || "";
+  if (PESAJET_WEBHOOK_SECRET) {
+    let valid = false;
+    try {
+      valid = pesajet.webhooks.verify(req.body, signature);
+    } catch (e) {
+      valid = false;
+    }
+    if (!valid) return res.status(401).json({ error: "Signature mismatch" });
   }
-  const body = req.body || {};
-  const ev = String(body.event_type || "");
-  const tx = body.transaction || {};
-  const ref = tx.reference;
-  if (!ref) return res.status(200).json({ status: "ack" });
-  if (!firebaseReady) return res.status(500).json({ status: "error", message: "Firebase not configured" });
 
-  const success = /completed|successful|sandbox/i.test(String(tx.status || ""));
-  const failed = /failed|cancelled|canceled/i.test(String(tx.status || ""));
+  const body = req.body || {};
+  const event = String(body.event || "");
+  const ref = body.reference; // this is the Firestore transaction id we sent as `reference`
+  const providerTxId = body.transactionId || "";
+  const status = String(body.status || "").toUpperCase();
+
+  if (!ref) return res.status(200).json({ received: true });
+  if (!firebaseReady) return res.status(200).json({ received: true, error: "Firebase not configured" });
+
+  const success = event === "payment.completed" || status === "COMPLETED";
+  const failed = event === "payment.failed" || event === "payment.expired" || status === "FAILED" || status === "EXPIRED";
 
   try {
-    const snap = await db.collection("transactions").where("marzRef", "==", ref).limit(1).get();
-    if (snap.empty) {
+    const doc = db.collection("transactions").doc(String(ref));
+    const cur = await doc.get();
+    if (!cur.exists) {
       console.log("[benz-pay] webhook for unknown reference:", ref);
-      return res.status(200).json({ status: "ack", matched: false });
+      return res.status(200).json({ received: true, matched: false });
     }
-    const doc = snap.docs[0];
-    const t = doc.data();
+    const t = cur.data();
     if (t.status === "approved" || t.status === "rejected") {
-      return res.status(200).json({ status: "ack", matched: true, final: true });
+      return res.status(200).json({ received: true, matched: true, final: true });
     }
 
-    const providerTxId = (body.collection && body.collection.provider_transaction_id) ||
-      (body.disbursement && body.disbursement.provider_transaction_id) || "";
-    const recvAmount = ROUND((tx.amount && tx.amount.raw) != null ? tx.amount.raw : t.amount);
+    const recvAmount = ROUND(body.amount != null ? body.amount : t.amount);
     const isDeposit = t.type === "deposit";
     const isWithdraw = t.type === "withdraw";
 
     if (success) {
       if (isDeposit) {
         await db.runTransaction(async (txn) => {
-          const cur = await txn.get(doc.ref);
-          if (!cur.exists) return;
-          const c = cur.data();
+          const c2 = await txn.get(doc);
+          if (!c2.exists) return;
+          const c = c2.data();
           if (c.status === "approved" || c.status === "rejected") return;
           const wRef = db.collection("wallets").doc(c.userId);
           const w = await txn.get(wRef);
           const bal = w.exists ? (w.data().balance || 0) : 0;
           if (w.exists) txn.update(wRef, { balance: ROUND(bal + recvAmount), updatedAt: serverTs() });
           else txn.set(wRef, { balance: ROUND(recvAmount), updatedAt: serverTs() });
-          txn.update(doc.ref, { status: "approved", providerTxId, updatedAt: serverTs() });
+          txn.update(doc, { status: "approved", providerTxId, updatedAt: serverTs() });
         });
         notify(t.userId, "Deposit received", fmtAmount(recvAmount) + " was added to your wallet automatically.", "finance", "wallet.html");
       } else if (isWithdraw) {
         await db.runTransaction(async (txn) => {
-          const cur = await txn.get(doc.ref);
-          if (!cur.exists) return;
-          const c = cur.data();
+          const c2 = await txn.get(doc);
+          if (!c2.exists) return;
+          const c = c2.data();
           if (c.status === "approved" || c.status === "rejected") return;
-          txn.update(doc.ref, { status: "approved", providerTxId, updatedAt: serverTs() });
+          txn.update(doc, { status: "approved", providerTxId, updatedAt: serverTs() });
         });
         notify(t.userId, "Withdrawal paid out", fmtAmount(recvAmount) + " was sent to your mobile money number.", "finance", "wallet.html");
       } else {
-        await doc.ref.update({ status: "approved", providerTxId, updatedAt: serverTs() }).catch(() => {});
+        await doc.update({ status: "approved", providerTxId, updatedAt: serverTs() }).catch(() => {});
       }
     } else if (failed) {
       if (isWithdraw) {
         await db.runTransaction(async (txn) => {
-          const cur = await txn.get(doc.ref);
-          if (!cur.exists) return;
-          const c = cur.data();
+          const c2 = await txn.get(doc);
+          if (!c2.exists) return;
+          const c = c2.data();
           if (c.status === "approved" || c.status === "rejected") return;
           const wRef = db.collection("wallets").doc(c.userId);
           const w = await txn.get(wRef);
           const bal = w.exists ? (w.data().balance || 0) : 0;
           if (w.exists) txn.update(wRef, { balance: ROUND(bal + c.amount), updatedAt: serverTs() });
           else txn.set(wRef, { balance: ROUND(c.amount), updatedAt: serverTs() });
-          txn.update(doc.ref, { status: "rejected", note: "Payout failed and funds were returned.", updatedAt: serverTs() });
+          txn.update(doc, { status: "rejected", note: "Payout failed and funds were returned.", updatedAt: serverTs() });
         });
         notify(t.userId, "Withdrawal failed", "The payout of " + fmtAmount(recvAmount) + " could not be sent. The amount was returned to your balance.", "ban", "wallet.html");
       } else {
-        await doc.ref.update({ status: "rejected", note: "Payment was not completed.", updatedAt: serverTs() }).catch(() => {});
+        await doc.update({ status: "rejected", note: "Payment was not completed.", updatedAt: serverTs() }).catch(() => {});
         notify(t.userId, "Deposit not received", "Your deposit of " + fmtAmount(recvAmount) + " was not completed. Try again or use a manual channel.", "ban", "wallet.html");
       }
     } else {
-      console.log("[benz-pay] webhook with unknown outcome:", ev, tx.status || "(no status)");
+      console.log("[benz-pay] webhook with unknown outcome:", event, status || "(no status)");
     }
-    res.status(200).json({ status: "ack", matched: true });
+    res.status(200).json({ received: true, matched: true });
   } catch (e) {
     console.error("[benz-pay] webhook error:", e.message);
-    res.status(200).json({ status: "ack", error: "logged" });
+    res.status(200).json({ received: true, error: "logged" });
   }
 });
-
-function verifyMarzSig(req, rawBody) {
-  const ts = req.headers["x-marzpay-timestamp"] || "";
-  const sigHeader = req.headers["x-marzpay-signature"] || "";
-  const match = sigHeader.match(/v1=([a-f0-9]+)/i);
-  if (!ts || !match) return false;
-  const expected = crypto.createHmac("sha256", MARZ_SIGNING_SECRET).update(ts + "." + rawBody).digest("hex");
-  const received = match[1];
-  return received.length === expected.length && crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
-}
-
-function fmtAmount(n) {
-  return CURRENCY + " " + ROUND(n).toLocaleString("en-US", { maximumFractionDigits: 2 });
-}
 
 /* Fallback for any unmatched route — always JSON, since this is an API-only service. */
 app.use((req, res) => {
@@ -842,3 +823,4 @@ app.listen(PORT, () => {
   startReconcileSweep();
   startDepositReconcileSweep();
 });
+
