@@ -211,6 +211,21 @@ app.get("/api/health", (req, res) => {
   res.json({ ok: true, firebase: firebaseReady, paymentsConfigured: !!PESAJET_API_KEY, ts: Date.now() });
 });
 
+/* Debug helper: reveals the IP this server actually egresses on, by asking
+ * a public IP-echo service. This is the IP PesaJet (or any outbound API
+ * call) sees as the caller — use it to fill in PesaJet's IP allowlist.
+ * Safe to leave in; remove later if you don't want it publicly reachable. */
+app.get("/api/my-egress-ip", async (req, res) => {
+  try {
+    const r = await fetch("https://api.ipify.org?format=json");
+    if (!r.ok) throw new Error("IP lookup service returned " + r.status);
+    const data = await r.json();
+    res.json({ ok: true, egressIp: data.ip });
+  } catch (e) {
+    res.status(502).json({ ok: false, message: e.message });
+  }
+});
+
 /* Validate payment-provider API credentials from the admin panel.
  * Kept at the same path the admin page already calls (/api/marz/balance)
  * so no admin-page changes are needed beyond swapping the server URL. */
